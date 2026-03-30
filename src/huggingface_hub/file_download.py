@@ -1344,6 +1344,17 @@ def _hf_hub_download_to_cache_dir(
         except OSError as e:
             if e.errno != errno.ENOSPC or not constants.HF_HUB_ENABLE_CACHE_EVICTION:
                 raise
+
+            # Check if another thread already freed space (parallel downloads hit ENOSPC together).
+            # If so, retry immediately without evicting or deleting the incomplete file.
+            try:
+                free_now = shutil.disk_usage(cache_dir).free
+                if free_now >= expected_size:
+                    _do_download()
+                    return pointer_path  # noqa: B012
+            except OSError:
+                pass
+
             logger.warning(
                 "Disk full (ENOSPC) during download. Attempting to evict least-recently-used "
                 "cache entries to free space..."
