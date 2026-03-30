@@ -13,6 +13,7 @@ from typing import Any, BinaryIO, Literal, NoReturn, Optional, Union, overload
 from urllib.parse import quote, urlparse
 
 import httpx
+from filelock import Timeout
 from tqdm.auto import tqdm as base_tqdm
 
 from . import constants
@@ -729,6 +730,129 @@ def _check_disk_space(expected_size: int, target_dir: Union[str, Path]) -> None:
             pass
 
 
+_EVICTION_LOCK_FILENAME = ".cache_eviction.lock"
+
+
+def _repo_has_active_download_locks(cache_dir: str, repo_folder: str) -> bool:
+    """Return `True` if a cached repo currently has an active download lock."""
+    repo_locks_dir = Path(cache_dir) / ".locks" / repo_folder
+    if not repo_locks_dir.exists():
+        return False
+
+    for lock_path in repo_locks_dir.rglob("*.lock"):
+        try:
+            with WeakFileLock(lock_path, timeout=0.01):
+                pass
+        except Timeout:
+            logger.debug(
+                "Cache eviction: skipping repo '%s' because download lock '%s' is active.",
+                repo_folder,
+                lock_path,
+            )
+            return True
+
+    return False
+
+
+def _try_evict_cache_for_space(
+    cache_dir: str,
+    needed_size: int,
+    current_repo_id: str,
+    current_repo_type: str,
+) -> bool:
+    """Try to free disk space by evicting least-recently-used cache entries.
+
+    Uses a file lock to prevent concurrent eviction from multiple processes. Protects
+    revisions that are currently referenced by a branch or tag (i.e., have refs). Detached
+    revisions (no refs) are evicted first, then ref'd revisions from other repos.
+
+    The currently downloading repo is never evicted.
+
+    Returns `True` if enough space was freed, `False` otherwise.
+    """
+    from .utils._cache_manager import scan_cache_dir
+
+    eviction_lock_path = os.path.join(cache_dir, ".locks", _EVICTION_LOCK_FILENAME)
+    Path(eviction_lock_path).parent.mkdir(parents=True, exist_ok=True)
+
+    with WeakFileLock(eviction_lock_path):
+        # Check if space appeared while waiting for the lock (another process may have evicted)
+        try:
+            free_space = shutil.disk_usage(cache_dir).free
+            if free_space >= needed_size:
+                logger.debug("Sufficient disk space appeared while waiting for eviction lock.")
+                return True
+        except OSError:
+            pass
+
+        cache_info = scan_cache_dir(cache_dir)
+
+        current_repo_folder = repo_folder_name(repo_id=current_repo_id, repo_type=current_repo_type)
+
+        # Build list of candidate revisions for eviction, ordered by priority:
+        # 1. Detached revisions (no refs) from other repos — safest to evict
+        # 2. Ref'd revisions from other repos — evict if we must
+        # Never evict from the repo we're currently downloading into.
+        detached_candidates: list[tuple[float, str]] = []
+        ref_candidates: list[tuple[float, str]] = []
+
+        for repo in cache_info.repos:
+            # Skip the repo we're currently downloading to
+            if repo.repo_path.name == current_repo_folder:
+                continue
+            if _repo_has_active_download_locks(cache_dir, repo.repo_path.name):
+                continue
+
+            for revision in repo.revisions:
+                # Use last_modified as the LRU key (last_accessed is unreliable on many
+                # filesystems that mount with noatime/relatime).
+                lru_key = revision.last_modified
+                if len(revision.refs) == 0:
+                    detached_candidates.append((lru_key, revision.commit_hash))
+                else:
+                    ref_candidates.append((lru_key, revision.commit_hash))
+
+        # Sort oldest first (lowest timestamp = least recently modified)
+        detached_candidates.sort(key=lambda x: x[0])
+        ref_candidates.sort(key=lambda x: x[0])
+
+        all_candidates = detached_candidates + ref_candidates
+
+        if not all_candidates:
+            logger.warning("Cache eviction: no candidate revisions found to evict.")
+            return False
+
+        revisions_to_delete: list[str] = []
+        expected_freed = 0
+
+        for _lru_key, commit_hash in all_candidates:
+            revisions_to_delete.append(commit_hash)
+
+            # Use the DeleteCacheStrategy to compute the actual freed size (accounting
+            # for shared blobs across revisions).
+            strategy = cache_info.delete_revisions(*revisions_to_delete)
+            expected_freed = strategy.expected_freed_size
+
+            if expected_freed >= needed_size:
+                break
+
+        if expected_freed < needed_size:
+            logger.warning(
+                f"Cache eviction: can only free {expected_freed / 1e6:.1f} MB "
+                f"but {needed_size / 1e6:.1f} MB is needed. Evicting what we can."
+            )
+
+        # Build the final strategy and execute
+        strategy = cache_info.delete_revisions(*revisions_to_delete)
+        logger.info(
+            f"Cache eviction: deleting {len(revisions_to_delete)} revision(s) "
+            f"to free {strategy.expected_freed_size_str}."
+        )
+        strategy.execute()
+
+        return expected_freed >= needed_size
+
+
 @overload
 def hf_hub_download(
     repo_id: str,
@@ -1198,7 +1322,7 @@ def _hf_hub_download_to_cache_dir(
 
     # Local file doesn't exist or etag isn't a match => retrieve file from remote (or cache)
 
-    with WeakFileLock(lock_path):
+    def _do_download() -> None:
         _download_to_tmp_and_move(
             incomplete_path=Path(blob_path + ".incomplete"),
             destination_path=Path(blob_path),
@@ -1213,6 +1337,36 @@ def _hf_hub_download_to_cache_dir(
         )
         if not os.path.exists(pointer_path):
             _create_symlink(blob_path, pointer_path, new_blob=True)
+
+    with WeakFileLock(lock_path):
+        try:
+            _do_download()
+        except OSError as e:
+            if e.errno != errno.ENOSPC or not constants.HF_HUB_ENABLE_CACHE_EVICTION:
+                raise
+            logger.warning(
+                "Disk full (ENOSPC) during download. Attempting to evict least-recently-used "
+                "cache entries to free space..."
+            )
+            # Clean up the incomplete file before evicting — its partial bytes won't help
+            incomplete_path = Path(blob_path + ".incomplete")
+            incomplete_path.unlink(missing_ok=True)
+
+            evicted = _try_evict_cache_for_space(
+                cache_dir=cache_dir,
+                needed_size=expected_size,
+                current_repo_id=repo_id,
+                current_repo_type=repo_type,
+            )
+            if not evicted:
+                raise OSError(
+                    errno.ENOSPC,
+                    f"Not enough disk space to download '{filename}' ({expected_size / 1e6:.1f} MB). "
+                    "Cache eviction could not free sufficient space. Free disk space manually or "
+                    "increase the available storage.",
+                ) from e
+            # Retry the download after eviction
+            _do_download()
 
     return pointer_path
 

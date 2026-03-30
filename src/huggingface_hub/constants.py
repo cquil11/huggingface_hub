@@ -282,3 +282,7 @@ HUGGINGFACE_HEADER_LINK_XET_AUTH_KEY = "xet-auth"
 default_xet_cache_path = os.path.join(HF_HOME, "xet")
 HF_XET_CACHE = os.getenv("HF_XET_CACHE", default_xet_cache_path)
 HF_HUB_DISABLE_XET: bool = _is_true(os.environ.get("HF_HUB_DISABLE_XET"))
+
+# Cache eviction: when enabled, automatically evict least-recently-used cache entries
+# when a download fails due to insufficient disk space (ENOSPC).
+HF_HUB_ENABLE_CACHE_EVICTION: bool = _is_true(os.environ.get("HF_HUB_ENABLE_CACHE_EVICTION"))
