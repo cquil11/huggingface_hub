@@ -732,49 +732,6 @@ def _check_disk_space(expected_size: int, target_dir: Union[str, Path]) -> None:
 
 _EVICTION_LOCK_FILENAME = ".cache_eviction.lock"
 
-# Error message patterns that indicate disk-full conditions from non-OS backends (e.g., xet storage).
-# These backends wrap the underlying ENOSPC in a RuntimeError or other exception type.
-_DISK_FULL_ERROR_PATTERNS = (
-    "no space left on device",
-    "writer channel closed",
-    "file reconstruction error",
-    "internal writer error",
-)
-
-
-def _is_disk_full_error(exc: BaseException, cache_dir: str) -> bool:
-    """Detect if an exception is caused by a full disk.
-
-    Some download backends (e.g., xet storage) don't raise OSError(ENOSPC) directly —
-    they crash with RuntimeError or similar. We detect these by:
-    1. Checking the error message for known patterns
-    2. Confirming the disk is actually full via shutil.disk_usage
-    """
-    error_msg = str(exc).lower()
-    has_pattern = any(p in error_msg for p in _DISK_FULL_ERROR_PATTERNS)
-
-    # Also check the __cause__ chain
-    cause = exc.__cause__
-    while cause and not has_pattern:
-        cause_msg = str(cause).lower()
-        has_pattern = any(p in cause_msg for p in _DISK_FULL_ERROR_PATTERNS)
-        if isinstance(cause, OSError) and cause.errno == errno.ENOSPC:
-            return True
-        cause = cause.__cause__
-
-    if not has_pattern:
-        return False
-
-    # Confirm disk is actually full
-    try:
-        free = shutil.disk_usage(cache_dir).free
-        logger.debug("[EVICTION DEBUG] Disk free space check for error heuristic: %.2f MB", free / 1e6)
-        # Consider "full" if less than 100MB free
-        return free < 100 * 1024 * 1024
-    except OSError:
-        # If we can't check, trust the error message pattern
-        return True
-
 
 def _repo_has_active_download_locks(cache_dir: str, repo_folder: str) -> bool:
     """Return `True` if a cached repo currently has an active download lock."""
@@ -1510,57 +1467,6 @@ def _hf_hub_download_to_cache_dir(
         if not os.path.exists(pointer_path):
             _create_symlink(blob_path, pointer_path, new_blob=True)
 
-    def _handle_disk_full(original_error: BaseException) -> None:
-        """Shared handler for disk-full errors from any download backend."""
-        logger.warning(
-            "[EVICTION] *** DISK FULL during download of '%s' ***\n"
-            "    File size needed: %.2f MB\n"
-            "    Original error: %s: %s\n"
-            "    Attempting LRU cache eviction...",
-            filename,
-            expected_size / 1e6,
-            type(original_error).__name__,
-            original_error,
-        )
-        # Clean up the incomplete file before evicting — its partial bytes won't help
-        incomplete_path = Path(blob_path + ".incomplete")
-        if incomplete_path.exists():
-            incomplete_size = incomplete_path.stat().st_size
-            logger.debug(
-                "[EVICTION DEBUG] Removing incomplete file: %s (%.2f MB)",
-                incomplete_path,
-                incomplete_size / 1e6,
-            )
-        else:
-            logger.debug("[EVICTION DEBUG] No incomplete file to remove.")
-        incomplete_path.unlink(missing_ok=True)
-
-        logger.debug("[EVICTION DEBUG] Calling _try_evict_cache_for_space()...")
-        evicted = _try_evict_cache_for_space(
-            cache_dir=cache_dir,
-            needed_size=expected_size,
-            current_repo_id=repo_id,
-            current_repo_type=repo_type,
-        )
-        logger.debug("[EVICTION DEBUG] _try_evict_cache_for_space returned: %s", evicted)
-
-        if not evicted:
-            logger.warning(
-                "[EVICTION] *** EVICTION FAILED *** Could not free enough space for '%s' (%.2f MB).",
-                filename,
-                expected_size / 1e6,
-            )
-            raise OSError(
-                errno.ENOSPC,
-                f"Not enough disk space to download '{filename}' ({expected_size / 1e6:.1f} MB). "
-                "Cache eviction could not free sufficient space. Free disk space manually or "
-                "increase the available storage.",
-            ) from original_error
-        # Retry the download after eviction
-        logger.debug("[EVICTION DEBUG] Retrying download of '%s' after successful eviction...", filename)
-        _do_download()
-        logger.debug("[EVICTION DEBUG] Retry download of '%s' completed successfully!", filename)
-
     with WeakFileLock(lock_path):
         try:
             logger.debug("[EVICTION DEBUG] Starting download of '%s' (expected_size=%s, etag=%s)", filename, expected_size, etag)
@@ -1584,23 +1490,51 @@ def _hf_hub_download_to_cache_dir(
                     constants.HF_HUB_ENABLE_CACHE_EVICTION,
                 )
                 raise
-            _handle_disk_full(e)
-        except (RuntimeError, Exception) as e:
-            # Xet storage and other backends may raise RuntimeError or other exception
-            # types when the disk is full instead of OSError(ENOSPC).
-            if not constants.HF_HUB_ENABLE_CACHE_EVICTION:
-                raise
-            logger.debug(
-                "[EVICTION DEBUG] Non-OSError caught during download: %s: %s",
-                type(e).__name__,
-                e,
+            logger.warning(
+                "[EVICTION] *** DISK FULL (ENOSPC) during download of '%s' ***\n"
+                "    File size needed: %.2f MB\n"
+                "    Attempting LRU cache eviction...",
+                filename,
+                expected_size / 1e6,
             )
-            if _is_disk_full_error(e, cache_dir):
-                logger.debug("[EVICTION DEBUG] Detected as disk-full error via heuristic. Attempting eviction.")
-                _handle_disk_full(e)
+            # Clean up the incomplete file before evicting — its partial bytes won't help
+            incomplete_path = Path(blob_path + ".incomplete")
+            if incomplete_path.exists():
+                incomplete_size = incomplete_path.stat().st_size
+                logger.debug(
+                    "[EVICTION DEBUG] Removing incomplete file: %s (%.2f MB)",
+                    incomplete_path,
+                    incomplete_size / 1e6,
+                )
             else:
-                logger.debug("[EVICTION DEBUG] NOT a disk-full error — re-raising.")
-                raise
+                logger.debug("[EVICTION DEBUG] No incomplete file to remove.")
+            incomplete_path.unlink(missing_ok=True)
+
+            logger.debug("[EVICTION DEBUG] Calling _try_evict_cache_for_space()...")
+            evicted = _try_evict_cache_for_space(
+                cache_dir=cache_dir,
+                needed_size=expected_size,
+                current_repo_id=repo_id,
+                current_repo_type=repo_type,
+            )
+            logger.debug("[EVICTION DEBUG] _try_evict_cache_for_space returned: %s", evicted)
+
+            if not evicted:
+                logger.warning(
+                    "[EVICTION] *** EVICTION FAILED *** Could not free enough space for '%s' (%.2f MB).",
+                    filename,
+                    expected_size / 1e6,
+                )
+                raise OSError(
+                    errno.ENOSPC,
+                    f"Not enough disk space to download '{filename}' ({expected_size / 1e6:.1f} MB). "
+                    "Cache eviction could not free sufficient space. Free disk space manually or "
+                    "increase the available storage.",
+                ) from e
+            # Retry the download after eviction
+            logger.debug("[EVICTION DEBUG] Retrying download of '%s' after successful eviction...", filename)
+            _do_download()
+            logger.debug("[EVICTION DEBUG] Retry download of '%s' completed successfully!", filename)
 
     return pointer_path
 
