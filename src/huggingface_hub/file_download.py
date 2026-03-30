@@ -1490,6 +1490,28 @@ def _hf_hub_download_to_cache_dir(
                     constants.HF_HUB_ENABLE_CACHE_EVICTION,
                 )
                 raise
+            # Check if another thread already freed space (parallel downloads hit ENOSPC together)
+            try:
+                free_now = shutil.disk_usage(cache_dir).free
+                logger.debug(
+                    "[EVICTION DEBUG] Post-ENOSPC disk check for '%s': free=%.2f MB, needed=%.2f MB",
+                    filename,
+                    free_now / 1e6,
+                    expected_size / 1e6,
+                )
+                if free_now >= expected_size:
+                    logger.debug(
+                        "[EVICTION DEBUG] Space already available for '%s' (another thread evicted). "
+                        "Retrying directly.",
+                        filename,
+                    )
+                    # Don't delete incomplete file — it has valid partial data for resume
+                    _do_download()
+                    logger.debug("[EVICTION DEBUG] Retry download of '%s' completed successfully (no eviction needed).", filename)
+                    return pointer_path  # noqa: B012
+            except OSError:
+                pass
+
             logger.warning(
                 "[EVICTION] *** DISK FULL (ENOSPC) during download of '%s' ***\n"
                 "    File size needed: %.2f MB\n"
