@@ -737,20 +737,25 @@ def _repo_has_active_download_locks(cache_dir: str, repo_folder: str) -> bool:
     """Return `True` if a cached repo currently has an active download lock."""
     repo_locks_dir = Path(cache_dir) / ".locks" / repo_folder
     if not repo_locks_dir.exists():
+        logger.debug("[EVICTION DEBUG] No locks dir for repo '%s' — no active locks.", repo_folder)
         return False
 
-    for lock_path in repo_locks_dir.rglob("*.lock"):
+    lock_files = list(repo_locks_dir.rglob("*.lock"))
+    logger.debug("[EVICTION DEBUG] Found %d lock file(s) in '%s': %s", len(lock_files), repo_locks_dir, lock_files)
+
+    for lock_path in lock_files:
         try:
             with WeakFileLock(lock_path, timeout=0.01):
-                pass
+                logger.debug("[EVICTION DEBUG]   Lock '%s' is NOT held — acquired and released.", lock_path)
         except Timeout:
             logger.debug(
-                "Cache eviction: skipping repo '%s' because download lock '%s' is active.",
-                repo_folder,
+                "[EVICTION DEBUG]   Lock '%s' IS HELD — repo '%s' has active download, skipping.",
                 lock_path,
+                repo_folder,
             )
             return True
 
+    logger.debug("[EVICTION DEBUG] No active locks for repo '%s'.", repo_folder)
     return False
 
 
@@ -770,24 +775,64 @@ def _try_evict_cache_for_space(
 
     Returns `True` if enough space was freed, `False` otherwise.
     """
+    import datetime
+
     from .utils._cache_manager import scan_cache_dir
+
+    logger.debug("=" * 80)
+    logger.debug("[EVICTION DEBUG] _try_evict_cache_for_space() called")
+    logger.debug("[EVICTION DEBUG]   cache_dir        = %s", cache_dir)
+    logger.debug("[EVICTION DEBUG]   needed_size      = %d bytes (%.2f MB)", needed_size, needed_size / 1e6)
+    logger.debug("[EVICTION DEBUG]   current_repo_id  = %s", current_repo_id)
+    logger.debug("[EVICTION DEBUG]   current_repo_type= %s", current_repo_type)
 
     eviction_lock_path = os.path.join(cache_dir, ".locks", _EVICTION_LOCK_FILENAME)
     Path(eviction_lock_path).parent.mkdir(parents=True, exist_ok=True)
+    logger.debug("[EVICTION DEBUG] Acquiring eviction lock: %s", eviction_lock_path)
 
     with WeakFileLock(eviction_lock_path):
+        logger.debug("[EVICTION DEBUG] Eviction lock acquired.")
+
         # Check if space appeared while waiting for the lock (another process may have evicted)
         try:
-            free_space = shutil.disk_usage(cache_dir).free
+            disk = shutil.disk_usage(cache_dir)
+            free_space = disk.free
+            logger.debug(
+                "[EVICTION DEBUG] Disk usage check: total=%.2f GB, used=%.2f GB, free=%.2f GB",
+                disk.total / 1e9,
+                disk.used / 1e9,
+                free_space / 1e9,
+            )
             if free_space >= needed_size:
-                logger.debug("Sufficient disk space appeared while waiting for eviction lock.")
+                logger.debug(
+                    "[EVICTION DEBUG] FREE SPACE (%.2f MB) >= NEEDED (%.2f MB) — "
+                    "space appeared while waiting for lock, skipping eviction.",
+                    free_space / 1e6,
+                    needed_size / 1e6,
+                )
                 return True
-        except OSError:
-            pass
+            logger.debug(
+                "[EVICTION DEBUG] Free space (%.2f MB) < needed (%.2f MB) — proceeding with eviction.",
+                free_space / 1e6,
+                needed_size / 1e6,
+            )
+        except OSError as e:
+            logger.debug("[EVICTION DEBUG] Could not check disk usage: %s", e)
 
+        logger.debug("[EVICTION DEBUG] Scanning cache directory...")
         cache_info = scan_cache_dir(cache_dir)
+        logger.debug(
+            "[EVICTION DEBUG] Cache scan complete: %d repos, %d warnings, total size=%s",
+            len(cache_info.repos),
+            len(cache_info.warnings),
+            cache_info.size_on_disk_str,
+        )
+        if cache_info.warnings:
+            for w in cache_info.warnings:
+                logger.debug("[EVICTION DEBUG]   Warning: %s", w)
 
         current_repo_folder = repo_folder_name(repo_id=current_repo_id, repo_type=current_repo_type)
+        logger.debug("[EVICTION DEBUG] Current repo folder (protected): %s", current_repo_folder)
 
         # Build list of candidate revisions for eviction, ordered by priority:
         # 1. Detached revisions (no refs) from other repos — safest to evict
@@ -796,20 +841,47 @@ def _try_evict_cache_for_space(
         detached_candidates: list[tuple[float, str]] = []
         ref_candidates: list[tuple[float, str]] = []
 
+        logger.debug("[EVICTION DEBUG] --- Scanning repos for eviction candidates ---")
         for repo in cache_info.repos:
+            logger.debug(
+                "[EVICTION DEBUG]   Repo: %s (type=%s, size=%s, revisions=%d, last_accessed=%s, last_modified=%s)",
+                repo.repo_id,
+                repo.repo_type,
+                repo.size_on_disk_str,
+                len(repo.revisions),
+                datetime.datetime.fromtimestamp(repo.last_accessed).isoformat(),
+                datetime.datetime.fromtimestamp(repo.last_modified).isoformat(),
+            )
+
             # Skip the repo we're currently downloading to
             if repo.repo_path.name == current_repo_folder:
+                logger.debug("[EVICTION DEBUG]     -> SKIPPED (current download target)")
                 continue
             if _repo_has_active_download_locks(cache_dir, repo.repo_path.name):
+                logger.debug("[EVICTION DEBUG]     -> SKIPPED (active download lock)")
                 continue
 
             for revision in repo.revisions:
                 # Use last_modified as the LRU key (last_accessed is unreliable on many
                 # filesystems that mount with noatime/relatime).
                 lru_key = revision.last_modified
+                lru_time_str = datetime.datetime.fromtimestamp(lru_key).isoformat()
                 if len(revision.refs) == 0:
+                    logger.debug(
+                        "[EVICTION DEBUG]     Revision %s: DETACHED (no refs), size=%s, last_modified=%s -> CANDIDATE (priority 1)",
+                        revision.commit_hash[:12],
+                        revision.size_on_disk_str,
+                        lru_time_str,
+                    )
                     detached_candidates.append((lru_key, revision.commit_hash))
                 else:
+                    logger.debug(
+                        "[EVICTION DEBUG]     Revision %s: refs=%s, size=%s, last_modified=%s -> CANDIDATE (priority 2)",
+                        revision.commit_hash[:12],
+                        revision.refs,
+                        revision.size_on_disk_str,
+                        lru_time_str,
+                    )
                     ref_candidates.append((lru_key, revision.commit_hash))
 
         # Sort oldest first (lowest timestamp = least recently modified)
@@ -818,13 +890,33 @@ def _try_evict_cache_for_space(
 
         all_candidates = detached_candidates + ref_candidates
 
+        logger.debug("[EVICTION DEBUG] --- Candidate summary ---")
+        logger.debug("[EVICTION DEBUG]   Detached candidates (evict first): %d", len(detached_candidates))
+        for i, (ts, h) in enumerate(detached_candidates):
+            logger.debug(
+                "[EVICTION DEBUG]     [%d] commit=%s last_modified=%s",
+                i,
+                h[:12],
+                datetime.datetime.fromtimestamp(ts).isoformat(),
+            )
+        logger.debug("[EVICTION DEBUG]   Ref'd candidates (evict if needed): %d", len(ref_candidates))
+        for i, (ts, h) in enumerate(ref_candidates):
+            logger.debug(
+                "[EVICTION DEBUG]     [%d] commit=%s last_modified=%s",
+                i,
+                h[:12],
+                datetime.datetime.fromtimestamp(ts).isoformat(),
+            )
+        logger.debug("[EVICTION DEBUG]   Total candidates: %d", len(all_candidates))
+
         if not all_candidates:
-            logger.warning("Cache eviction: no candidate revisions found to evict.")
+            logger.warning("[EVICTION DEBUG] NO CANDIDATES — nothing to evict. Returning False.")
             return False
 
         revisions_to_delete: list[str] = []
         expected_freed = 0
 
+        logger.debug("[EVICTION DEBUG] --- Selecting revisions to delete ---")
         for _lru_key, commit_hash in all_candidates:
             revisions_to_delete.append(commit_hash)
 
@@ -833,24 +925,61 @@ def _try_evict_cache_for_space(
             strategy = cache_info.delete_revisions(*revisions_to_delete)
             expected_freed = strategy.expected_freed_size
 
+            logger.debug(
+                "[EVICTION DEBUG]   + Added %s -> cumulative freed = %.2f MB (need %.2f MB)",
+                commit_hash[:12],
+                expected_freed / 1e6,
+                needed_size / 1e6,
+            )
+
             if expected_freed >= needed_size:
+                logger.debug("[EVICTION DEBUG]   Enough space can be freed! Stopping selection.")
                 break
 
         if expected_freed < needed_size:
             logger.warning(
-                f"Cache eviction: can only free {expected_freed / 1e6:.1f} MB "
-                f"but {needed_size / 1e6:.1f} MB is needed. Evicting what we can."
+                "[EVICTION DEBUG] INSUFFICIENT: can only free %.1f MB but %.1f MB is needed. "
+                "Evicting what we can.",
+                expected_freed / 1e6,
+                needed_size / 1e6,
             )
 
         # Build the final strategy and execute
         strategy = cache_info.delete_revisions(*revisions_to_delete)
+        logger.debug("[EVICTION DEBUG] --- Final deletion strategy ---")
+        logger.debug("[EVICTION DEBUG]   Revisions to delete: %d", len(revisions_to_delete))
+        for h in revisions_to_delete:
+            logger.debug("[EVICTION DEBUG]     - %s", h)
+        logger.debug("[EVICTION DEBUG]   Repos to delete entirely: %d (%s)", len(strategy.repos), strategy.repos)
+        logger.debug("[EVICTION DEBUG]   Snapshots to delete: %d (%s)", len(strategy.snapshots), strategy.snapshots)
+        logger.debug("[EVICTION DEBUG]   Blobs to delete: %d (%s)", len(strategy.blobs), strategy.blobs)
+        logger.debug("[EVICTION DEBUG]   Refs to delete: %d (%s)", len(strategy.refs), strategy.refs)
+        logger.debug("[EVICTION DEBUG]   Expected freed: %s", strategy.expected_freed_size_str)
+
         logger.info(
-            f"Cache eviction: deleting {len(revisions_to_delete)} revision(s) "
-            f"to free {strategy.expected_freed_size_str}."
+            "[EVICTION] Executing: deleting %d revision(s) to free %s.",
+            len(revisions_to_delete),
+            strategy.expected_freed_size_str,
         )
         strategy.execute()
+        logger.debug("[EVICTION DEBUG] Deletion complete.")
 
-        return expected_freed >= needed_size
+        # Post-eviction disk check
+        try:
+            disk_after = shutil.disk_usage(cache_dir)
+            logger.debug(
+                "[EVICTION DEBUG] Post-eviction disk: total=%.2f GB, used=%.2f GB, free=%.2f GB",
+                disk_after.total / 1e9,
+                disk_after.used / 1e9,
+                disk_after.free / 1e9,
+            )
+        except OSError:
+            pass
+
+        success = expected_freed >= needed_size
+        logger.debug("[EVICTION DEBUG] Returning %s", success)
+        logger.debug("=" * 80)
+        return success
 
 
 @overload
@@ -1340,25 +1469,62 @@ def _hf_hub_download_to_cache_dir(
 
     with WeakFileLock(lock_path):
         try:
+            logger.debug("[EVICTION DEBUG] Starting download of '%s' (expected_size=%s, etag=%s)", filename, expected_size, etag)
+            logger.debug("[EVICTION DEBUG]   blob_path    = %s", blob_path)
+            logger.debug("[EVICTION DEBUG]   pointer_path = %s", pointer_path)
+            logger.debug("[EVICTION DEBUG]   cache_dir    = %s", cache_dir)
+            logger.debug("[EVICTION DEBUG]   HF_HUB_ENABLE_CACHE_EVICTION = %s", constants.HF_HUB_ENABLE_CACHE_EVICTION)
             _do_download()
+            logger.debug("[EVICTION DEBUG] Download of '%s' completed successfully (no ENOSPC).", filename)
         except OSError as e:
+            logger.debug(
+                "[EVICTION DEBUG] OSError caught during download: errno=%s (%s), message='%s'",
+                e.errno,
+                errno.errorcode.get(e.errno, "UNKNOWN") if e.errno else "None",
+                e,
+            )
             if e.errno != errno.ENOSPC or not constants.HF_HUB_ENABLE_CACHE_EVICTION:
+                logger.debug(
+                    "[EVICTION DEBUG] NOT handling: errno_is_ENOSPC=%s, eviction_enabled=%s -> re-raising.",
+                    e.errno == errno.ENOSPC,
+                    constants.HF_HUB_ENABLE_CACHE_EVICTION,
+                )
                 raise
             logger.warning(
-                "Disk full (ENOSPC) during download. Attempting to evict least-recently-used "
-                "cache entries to free space..."
+                "[EVICTION] *** DISK FULL (ENOSPC) during download of '%s' ***\n"
+                "    File size needed: %.2f MB\n"
+                "    Attempting LRU cache eviction...",
+                filename,
+                expected_size / 1e6,
             )
             # Clean up the incomplete file before evicting — its partial bytes won't help
             incomplete_path = Path(blob_path + ".incomplete")
+            if incomplete_path.exists():
+                incomplete_size = incomplete_path.stat().st_size
+                logger.debug(
+                    "[EVICTION DEBUG] Removing incomplete file: %s (%.2f MB)",
+                    incomplete_path,
+                    incomplete_size / 1e6,
+                )
+            else:
+                logger.debug("[EVICTION DEBUG] No incomplete file to remove.")
             incomplete_path.unlink(missing_ok=True)
 
+            logger.debug("[EVICTION DEBUG] Calling _try_evict_cache_for_space()...")
             evicted = _try_evict_cache_for_space(
                 cache_dir=cache_dir,
                 needed_size=expected_size,
                 current_repo_id=repo_id,
                 current_repo_type=repo_type,
             )
+            logger.debug("[EVICTION DEBUG] _try_evict_cache_for_space returned: %s", evicted)
+
             if not evicted:
+                logger.warning(
+                    "[EVICTION] *** EVICTION FAILED *** Could not free enough space for '%s' (%.2f MB).",
+                    filename,
+                    expected_size / 1e6,
+                )
                 raise OSError(
                     errno.ENOSPC,
                     f"Not enough disk space to download '{filename}' ({expected_size / 1e6:.1f} MB). "
@@ -1366,7 +1532,9 @@ def _hf_hub_download_to_cache_dir(
                     "increase the available storage.",
                 ) from e
             # Retry the download after eviction
+            logger.debug("[EVICTION DEBUG] Retrying download of '%s' after successful eviction...", filename)
             _do_download()
+            logger.debug("[EVICTION DEBUG] Retry download of '%s' completed successfully!", filename)
 
     return pointer_path
 

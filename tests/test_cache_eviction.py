@@ -83,7 +83,7 @@ def _mock_disk_full():
     """Mock shutil.disk_usage to report zero free space (simulating ENOSPC context)."""
     return patch(
         "huggingface_hub.file_download.shutil.disk_usage",
-        return_value=type("Usage", (), {"free": 0})(),
+        return_value=type("Usage", (), {"free": 0, "total": 100_000_000_000, "used": 100_000_000_000})(),
     )
 
 
@@ -303,7 +303,8 @@ class TestTryEvictCacheForSpace(unittest.TestCase):
 
             # Mock disk_usage to report plenty of free space
             with patch("huggingface_hub.file_download.shutil.disk_usage") as mock_du:
-                mock_du.return_value = type("Usage", (), {"free": 999_999_999})()
+                mock_du.return_value = type("Usage", (), {"free": 999_999_999, "total": 1_000_000_000, "used": 1_000})()
+
 
                 result = _try_evict_cache_for_space(
                     cache_dir=cache_dir,
